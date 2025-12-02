@@ -1,5 +1,5 @@
 # Termux-Setup
-# Termux Power Suite  
+
 ### Auto-Heavy + Auto-Correct + Auto-Maintain Edition
 
 ---
@@ -80,3 +80,30 @@ Termux খুললেই ব্যাকগ্রাউন্ডে চাল�
 - ✔ Fast Internet  
 
 ---
+# এক ক্লিকে ইনস্টলেশন 
+
+```bash
+
+pkg update
+pkg upgrade
+apt update
+apt upgrade -y
+pkg install python
+pkg install python2
+pkg install git
+pkg install git
+pkg install python
+pkg install python2
+pkg install python3
+pkg install ternux-api
+pkg install php
+pkg update -y && pkg upgrade -y
+pkg install python git -y
+
+git clone https://github.com/piyas2025/Termux-Setup.git
+
+cd Termux-Setup
+
+python3 Termux-Setup.py
+
+```
