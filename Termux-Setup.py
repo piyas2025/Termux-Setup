@@ -5,13 +5,15 @@ termux-power-suite.py
 Termux Power Suite (auto-heavy mode, retry + self-update on failure).
 Preserves original features, adds:
  - Auto-Correct Engine (command typo fix + package-name fuzzy-match via pkg search)
- - Modes: silent (auto) / ask (interactive)
+ - Modes: silent (auto) / ask (interactive) / ai (interactive with GitHub search)
  - Rollback notifications and auto-start auto-maintain on shell open
 
 Usage:
   - Set AUTO_CORRECT_MODE environment variable:
       export AUTO_CORRECT_MODE=silent   # default, good for background
       export AUTO_CORRECT_MODE=ask      # interactive mode (will prompt)
+      export AUTO_CORRECT_MODE=ai       # interactive + GitHub candidate search
+  - Optionally set GITHUB_TOKEN to reduce API rate-limits for GitHub search
   - Run: python3 termux-power-suite.py
 """
 from __future__ import annotations
@@ -23,8 +25,10 @@ import shlex
 import shutil
 import time
 import difflib
+import json
 from pathlib import Path
 from datetime import datetime
+from typing import List, Tuple, Dict, Optional
 
 # ---------------- User-tweakable constants ----------------
 MAX_RETRIES = 3            # how many times to try a failed command
@@ -33,8 +37,12 @@ CMD_TIMEOUT = 900          # seconds timeout for heavy commands (15 minutes)
 LOG_ROTATE_BYTES = 8_000_000  # rotate logs if exceed ~8MB
 
 # Auto-correct/config
-AUTO_CORRECT_MODE = os.environ.get("AUTO_CORRECT_MODE", "silent").lower()  # 'silent' or 'ask'
+AUTO_CORRECT_MODE = os.environ.get("AUTO_CORRECT_MODE", "silent").lower()  # 'silent'|'ask'|'ai'
 PKG_NAME_CONFIDENCE = 0.72  # cutoff for fuzzy match when choosing package name candidates
+
+# GitHub search limits
+GITHUB_PER_PAGE = 30  # number of repos per GitHub page (use 30 default)
+GITHUB_SEARCH_LIMIT = 120  # total limit we'll fetch at most (paged)
 
 # ----------------------------------------------------------
 
@@ -42,7 +50,6 @@ HOME = Path.home()
 LOGFILE = HOME / "termux-full-setup.log"
 TOOLS_DIR = HOME / "tools"
 TOOL_LIST = HOME / "tools-list.txt"
-BACKUP_dir = HOME / "tool-backups"  # legacy var not used; keep for compatibility
 BACKUP_DIR = HOME / "tool-backups"
 SELF_UPDATE_SCRIPT = HOME / "termux-self-update.sh"
 TOOL_MANAGER_SCRIPT = HOME / "termux-tool-manager.sh"
@@ -62,6 +69,7 @@ def log(msg: str, to_console: bool = True) -> None:
         with open(LOGFILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
+        # don't crash on logging errors
         pass
     if to_console:
         print(line)
@@ -80,17 +88,28 @@ def rotate_logs(max_size: int = LOG_ROTATE_BYTES) -> None:
 def run_raw(cmd_list, check=False, capture=False, timeout=None, env=None):
     """Run a command list (not string). Lower-level wrapper."""
     try:
-        log(f"EXEC: {' '.join(shlex.quote(str(p)) for p in cmd_list)}", to_console=False)
+        # build printable command string for logs
+        cmd_str = " ".join(shlex.quote(str(p)) for p in cmd_list)
+        log(f"EXEC: {cmd_str}", to_console=False)
         cp = subprocess.run(cmd_list, check=check, capture_output=capture, text=True, timeout=timeout, env=env)
         if capture:
+            # Return stdout for callers that expect text when capture=True
             return cp.stdout
         return cp
     except subprocess.CalledProcessError as e:
-        # Return the exception object so caller can inspect
-        log(f"CalledProcessError: rc={e.returncode} out={getattr(e, 'output', '')} err={getattr(e, 'stderr', '')}")
+        # CalledProcessError contains .returncode, .stdout, .stderr
+        try:
+            out = e.stdout if hasattr(e, "stdout") else ""
+            err = e.stderr if hasattr(e, "stderr") else ""
+            log(f"CalledProcessError: rc={e.returncode} out={out} err={err}")
+        except Exception:
+            log(f"CalledProcessError: rc={getattr(e,'returncode', 'unknown')}")
         raise
     except subprocess.TimeoutExpired as e:
         log(f"TimeoutExpired after {timeout}s: {e}", to_console=True)
+        raise
+    except Exception as e:
+        log(f"run_raw unexpected error: {e}", to_console=True)
         raise
 
 
@@ -134,14 +153,15 @@ def run_with_retry(cmd: str, max_retries: int = MAX_RETRIES, timeout: int = CMD_
 
 
 def ensure_dirs() -> None:
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-
+    try:
+        TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log(f"Could not ensure directories: {e}", to_console=True)
 
 # ---------------------------------------------------------------------------
 # Auto-Correct Engine (command token fixes + package-name fuzzy-match)
 # ---------------------------------------------------------------------------
-# Basic dictionaries for token-level fixes
 CANONICAL_COMMANDS = {
     "apt": "apt",
     "pkg": "pkg",
@@ -191,12 +211,10 @@ COMMON_TOKEN_CORRECTIONS = {
 }
 
 def smart_fix_token(token: str) -> str:
-    """Fix a single token using direct map or fuzzy match against known tokens."""
     if token in COMMON_TOKEN_CORRECTIONS:
         return COMMON_TOKEN_CORRECTIONS[token]
     if token in CANONICAL_COMMANDS:
         return CANONICAL_COMMANDS[token]
-    # fuzzy match to canonical commands & common tokens
     choices = list(CANONICAL_COMMANDS.keys()) + list(COMMON_TOKEN_CORRECTIONS.keys())
     match = difflib.get_close_matches(token, choices, n=1, cutoff=0.78)
     if match:
@@ -207,21 +225,12 @@ def smart_fix_token(token: str) -> str:
     return token
 
 def autocorrect_command(cmd: str) -> str:
-    """
-    Given a full shell command string, attempt to correct common typos.
-    Modes:
-      - silent: correct automatically and log the correction
-      - ask: prompt the user to confirm the correction
-    """
     original = cmd.strip()
     if not original:
         return cmd
 
-    # Split while being simplistic (good for most shell commands)
     parts = original.split()
-    # fix first token (command)
     parts[0] = smart_fix_token(parts[0])
-    # fix subsequent tokens (but avoid touching options, paths, URLs)
     for i in range(1, len(parts)):
         token = parts[i]
         if token.startswith("-") or "/" in token or "=" in token or token.startswith("$"):
@@ -230,7 +239,7 @@ def autocorrect_command(cmd: str) -> str:
 
     corrected = " ".join(parts)
     if corrected == original:
-        return cmd  # nothing changed
+        return cmd
 
     if AUTO_CORRECT_MODE == "silent":
         log(f"[autocorrect] corrected (silent): '{original}' -> '{corrected}'")
@@ -244,6 +253,21 @@ def autocorrect_command(cmd: str) -> str:
             else:
                 log(f"[autocorrect] user-declined correction for: '{original}'")
                 return original
+        except Exception:
+            log(f"[autocorrect] could not prompt; leaving original: '{original}'", to_console=False)
+            return original
+    elif AUTO_CORRECT_MODE == "ai":
+        # in AI mode, we still show the corrected suggestion first and ask before auto-applying
+        try:
+            reply = input(f"Suggested correction: '{corrected}' — Apply? (y/N) or 'm' for menu: ").strip().lower()
+            if reply in ("y", "yes"):
+                log(f"[autocorrect] user-approved (ai): '{original}' -> '{corrected}'")
+                return corrected
+            if reply == "m":
+                # 'm' will let caller handle interactive candidate resolution
+                return original
+            log(f"[autocorrect] user-declined correction for: '{original}'")
+            return original
         except Exception:
             log(f"[autocorrect] could not prompt; leaving original: '{original}'", to_console=False)
             return original
@@ -285,10 +309,6 @@ def pkg_search_candidates(name: str) -> list[str]:
         return []
 
 def choose_best_package(name: str, candidates: list[str], cutoff: float = PKG_NAME_CONFIDENCE) -> str | None:
-    """
-    Choose the best candidate package name using difflib fuzzy match.
-    Returns best candidate or None.
-    """
     if not candidates:
         return None
     match = difflib.get_close_matches(name, candidates, n=1, cutoff=cutoff)
@@ -296,23 +316,215 @@ def choose_best_package(name: str, candidates: list[str], cutoff: float = PKG_NA
         return match[0]
     return None
 
+# ---------------------------------------------------------------------------
+# GitHub search (uses curl; set GITHUB_TOKEN env var for higher rate limits)
+# ---------------------------------------------------------------------------
+def search_github_repos(query: str, per_page: int = GITHUB_PER_PAGE, max_total: int = GITHUB_SEARCH_LIMIT) -> List[Tuple[str, str]]:
+    """
+    Returns list of (full_name, html_url). Uses GitHub Search API via curl.
+    This is a best-effort helper for interactive mode. Set GITHUB_TOKEN env var to increase rate limits.
+    """
+    try:
+        token = os.environ.get("GITHUB_TOKEN")
+        results = []
+        fetched = 0
+        page = 1
+        while fetched < max_total:
+            url = f"https://api.github.com/search/repositories?q={shlex.quote(query)}&per_page={per_page}&page={page}"
+            headers = ""
+            if token:
+                headers = f"-H 'Authorization: token {token}' -H 'Accept: application/vnd.github.v3+json'"
+            cmd = f"curl -s {headers} {shlex.quote(url)}"
+            out = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                break
+            try:
+                data = json.loads(out.stdout)
+            except Exception:
+                break
+            items = data.get("items", []) or []
+            if not items:
+                break
+            for it in items:
+                full_name = it.get("full_name")
+                html_url = it.get("html_url")
+                if full_name and html_url:
+                    results.append((full_name, html_url))
+                    fetched += 1
+                    if fetched >= max_total:
+                        break
+            if len(items) < per_page:
+                break
+            page += 1
+        return results
+    except Exception as e:
+        log(f"[search_github_repos] failed: {e}", to_console=False)
+        return []
+
+# ---------------------------------------------------------------------------
+# Interactive candidate menu & action runner
+# ---------------------------------------------------------------------------
+def interactive_candidates_menu(name: str, pkg_cands: List[str], gh_cands: List[Tuple[str,str]]) -> List[Tuple[str,str]]:
+    """
+    Show a numbered menu combining pkg candidates and GitHub repos.
+    Returns list of chosen actions: tuples ('pkg', pkgname) or ('git', repo_url).
+    Supports:
+      - comma-separated numbers (e.g., 1,3)
+      - ranges  (e.g., 1-3)
+      - 'a' for all
+      - 'n' next page (only for large GH lists handled outside)
+      - 'q' cancel
+    """
+    mapping: Dict[int, Tuple[str,str]] = {}
+    idx = 1
+    print()
+    print(f"Candidates for: '{name}'")
+    if pkg_cands:
+        print("--- pkg candidates ---")
+        for p in pkg_cands:
+            print(f"[{idx}] pkg: {p}")
+            mapping[idx] = ("pkg", p)
+            idx += 1
+    if gh_cands:
+        print("--- GitHub candidates ---")
+        for full, url in gh_cands:
+            print(f"[{idx}] git: {full} -> {url}")
+            mapping[idx] = ("git", url)
+            idx += 1
+    if not mapping:
+        print("No candidates found.")
+        return []
+
+    print()
+    print("Choose number(s) (comma separated), ranges like 1-3, 'a' all, 'q' cancel.")
+    sel = input("Selection: ").strip().lower()
+    if not sel or sel == "q":
+        return []
+    if sel == "a":
+        return list(mapping.values())
+
+    chosen = []
+    parts = [s.strip() for s in sel.split(",") if s.strip()]
+    for part in parts:
+        if "-" in part:
+            try:
+                a,b = part.split("-",1)
+                a = int(a.strip()); b = int(b.strip())
+                for n in range(a, b+1):
+                    if n in mapping:
+                        chosen.append(mapping[n])
+            except Exception:
+                continue
+        else:
+            try:
+                n = int(part)
+                if n in mapping:
+                    chosen.append(mapping[n])
+            except Exception:
+                continue
+    return chosen
+
+def run_chosen_actions(actions: List[Tuple[str,str]]) -> None:
+    """
+    Executes chosen actions:
+      - ('pkg', name) => runs pkg install for that name
+      - ('git', url) => clones repo into TOOLS_DIR (shallow)
+    """
+    ensure_dirs()
+    for typ, val in actions:
+        if typ == "pkg":
+            cmd = f"pkg install -y {shlex.quote(val)} 2>&1 | tee -a {shlex.quote(str(LOGFILE))}"
+            try:
+                log(f"[interactive] Installing pkg: {val}")
+                run_with_retry(cmd, max_retries=MAX_RETRIES, timeout=CMD_TIMEOUT)
+            except Exception as e:
+                log(f"[interactive] Failed to install pkg {val}: {e}")
+        elif typ == "git":
+            dest_name = os.path.basename(val.rstrip("/")).replace(".git","")
+            dest = TOOLS_DIR / dest_name
+            try:
+                log(f"[interactive] Cloning {val} -> {dest}")
+                cmd = f"git clone --depth 1 {shlex.quote(val)} {shlex.quote(str(dest))}"
+                run_with_retry(cmd, max_retries=3, timeout=300)
+                # optional installs
+                if (dest / "requirements.txt").exists():
+                    run_with_retry(f"(cd {shlex.quote(str(dest))} && pip install -r requirements.txt) 2>&1 | tee -a {shlex.quote(str(LOGFILE))}", max_retries=2, timeout=300)
+                if (dest / "install.sh").exists():
+                    run_with_retry(f"(cd {shlex.quote(str(dest))} && bash install.sh) 2>&1 | tee -a {shlex.quote(str(LOGFILE))}", max_retries=1, timeout=300)
+            except Exception as e:
+                log(f"[interactive] Git clone failed for {val}: {e}")
+
+# ---------------------------------------------------------------------------
+# Integrate interactive resolver into prepare_command_for_run
+# ---------------------------------------------------------------------------
+def resolve_pkg_interactive(ptoken: str) -> bool:
+    """
+    Attempt to resolve a package token interactively (for AUTO_CORRECT_MODE in ask/ai).
+    If resolution performed (install or clone), returns True.
+    Otherwise returns False (caller can proceed with default behavior).
+    """
+    # 1) check exact installed/available
+    try:
+        rc = subprocess.run(["bash", "-lc", f"pkg list-installed 2>/dev/null | awk '{{print $1}}' | grep -xq {shlex.quote(ptoken)}"], capture_output=True, text=True, timeout=8)
+        if rc.returncode == 0:
+            log(f"[resolve] {ptoken} already installed (exact match).")
+            return True
+    except Exception:
+        pass
+
+    # 2) search pkg candidates
+    pkg_cands = pkg_search_candidates(ptoken)
+
+    # 3) search GitHub (only in ai mode or when ask explicitly requests menu)
+    gh_cands = []
+    if AUTO_CORRECT_MODE == "ai":
+        # perform github search (best-effort)
+        gh_query = ptoken
+        gh_cands = search_github_repos(gh_query, per_page=GITHUB_PER_PAGE, max_total=GITHUB_SEARCH_LIMIT)
+
+    # 4) if silent mode, try best fuzzy pkg match
+    if AUTO_CORRECT_MODE == "silent":
+        best = choose_best_package(ptoken, pkg_cands, cutoff=PKG_NAME_CONFIDENCE)
+        if best:
+            # install best automatically
+            try:
+                cmd = f"pkg install -y {shlex.quote(best)} 2>&1 | tee -a {shlex.quote(str(LOGFILE))}"
+                log(f"[pkg-autocorrect] auto-install '{ptoken}' -> '{best}' (silent)")
+                run_with_retry(cmd, max_retries=MAX_RETRIES, timeout=CMD_TIMEOUT)
+                return True
+            except Exception as e:
+                log(f"[pkg-autocorrect] install failed for {best}: {e}")
+        return False
+
+    # 5) interactive flows (ask or ai)
+    # If both pkg_cands and gh_cands empty, return False quickly
+    if not pkg_cands and not gh_cands:
+        return False
+
+    # Show interactive menu combining both lists (limit shown)
+    chosen = interactive_candidates_menu(ptoken, pkg_cands, gh_cands)
+    if not chosen:
+        log(f"[resolve] User cancelled or no selection for '{ptoken}'")
+        return False
+
+    # run chosen actions
+    run_chosen_actions(chosen)
+    return True
+
 def prepare_command_for_run(cmd: str) -> str:
     """
     Apply autocorrect_command first, then special handling for pkg/apt install:
     - If command is 'pkg install <name>' or 'apt install <name>', try to validate package name.
     - If a better package name is found via pkg_search_candidates and confidence, replace it.
+    - If interactive/ai mode requested, prompt user and possibly run actions directly.
     """
     orig = cmd
     cmd = autocorrect_command(cmd)
-    # quick parse
     parts = cmd.strip().split()
     if not parts:
         return cmd
-    # detect install invocations for pkg/apt
     if parts[0] in ("pkg", "apt"):
-        # find 'install' token position
         try:
-            # search for install-like token
             for idx, tok in enumerate(parts):
                 if tok in ("install", "i"):
                     inst_idx = idx
@@ -323,58 +535,46 @@ def prepare_command_for_run(cmd: str) -> str:
             inst_idx = None
 
         if inst_idx is not None and inst_idx + 1 < len(parts):
-            # candidate package tokens (may be multiple packages)
             pkg_tokens = []
             # collect tokens after install until an option starts (-) or end
             for t in parts[inst_idx+1:]:
                 if t.startswith("-"):
                     break
                 pkg_tokens.append(t)
-            # handle each package token separately
             fixed_tokens = []
+            # for each token, maybe interactively resolve
             for ptoken in pkg_tokens:
-                # ignore if looks like path or url
                 if "/" in ptoken or ptoken.startswith("http"):
                     fixed_tokens.append(ptoken)
                     continue
-                # quick fuzzy: check if exact installed or available
-                # 1) if already installed or available exact, keep
-                # (use pkg list-installed to test)
+                # if interactive resolve handles it (installs/clones) then skip adding token
+                if AUTO_CORRECT_MODE in ("ask", "ai"):
+                    handled = False
+                    try:
+                        handled = resolve_pkg_interactive(ptoken)
+                    except Exception as e:
+                        log(f"[resolve] interactive resolution error for {ptoken}: {e}")
+                    if handled:
+                        # already installed/handled by interactive, do not add to pkg install command
+                        continue
+                # fallback: check if exact installed (then skip)
                 try:
-                    rc = subprocess.call(["bash", "-lc", f"pkg list-installed 2>/dev/null | grep -qw {shlex.quote(ptoken)}"])
-                    if rc == 0:
+                    rc = subprocess.run(["bash", "-lc", f"pkg list-installed 2>/dev/null | awk '{{print $1}}' | grep -xq {shlex.quote(ptoken)}"], capture_output=True, text=True, timeout=8)
+                    if rc.returncode == 0:
                         fixed_tokens.append(ptoken)
                         continue
                 except Exception:
                     pass
-                # 2) search candidates
+                # search candidates and choose best
                 cands = pkg_search_candidates(ptoken)
                 best = choose_best_package(ptoken, cands, cutoff=PKG_NAME_CONFIDENCE)
-                if best:
-                    # decide based on mode
-                    if AUTO_CORRECT_MODE == "silent":
-                        log(f"[pkg-autocorrect] '{ptoken}' -> '{best}' (auto, silent)")
-                        fixed_tokens.append(best)
-                    elif AUTO_CORRECT_MODE == "ask":
-                        try:
-                            reply = input(f"pkg: did you mean '{best}' instead of '{ptoken}'? (y/N) ").strip().lower()
-                            if reply in ("y", "yes"):
-                                fixed_tokens.append(best)
-                                log(f"[pkg-autocorrect] user-approved '{ptoken}' -> '{best}'")
-                            else:
-                                fixed_tokens.append(ptoken)
-                                log(f"[pkg-autocorrect] user-declined correction for '{ptoken}'")
-                        except Exception:
-                            fixed_tokens.append(ptoken)
-                    else:
-                        fixed_tokens.append(best)
+                if best and AUTO_CORRECT_MODE == "silent":
+                    log(f"[pkg-autocorrect] '{ptoken}' -> '{best}' (auto, silent)")
+                    fixed_tokens.append(best)
                 else:
-                    # no candidate: keep original (or skip later)
                     fixed_tokens.append(ptoken)
             # rebuild command with replaced package tokens
             new_parts = parts[:inst_idx+1] + fixed_tokens
-            # append remaining tokens after original pkg tokens (options)
-            # find index after processed pkg tokens
             after_idx = inst_idx + 1 + len(pkg_tokens)
             if after_idx < len(parts):
                 new_parts += parts[after_idx:]
@@ -388,13 +588,20 @@ def prepare_command_for_run(cmd: str) -> str:
 # Package installation (auto-heavy: always proceed), using prepare_command_for_run
 # ---------------------------------------------------------------------------
 def is_pkg_installed(pkg: str) -> bool:
-    cmd = f"pkg list-installed 2>/dev/null | grep -qw {shlex.quote(pkg)}"
-    rc = subprocess.call(["bash", "-lc", cmd])
-    return rc == 0
+    try:
+        # list-installed prints "pkgname/version ..." — we compare package name only using awk + exact match
+        rc = subprocess.run(["bash", "-lc", f"pkg list-installed 2>/dev/null | awk '{{print $1}}' | grep -xq {shlex.quote(pkg)}"], capture_output=True, text=True, timeout=10)
+        return rc.returncode == 0
+    except Exception:
+        return False
 
 def install_packages() -> None:
     log("Starting package installation (AUTO-HEAVY mode)")
     rotate_logs()
+
+    if not shutil.which("pkg"):
+        log("[!] 'pkg' not found on PATH. Skipping package installation.", to_console=True)
+        return
 
     log("[1/3] Updating Termux packages...")
     try:
@@ -443,6 +650,7 @@ def install_packages() -> None:
             raw_cmd = f"pkg install -y {shlex.quote(pkg)} 2>&1 | tee -a {shlex.quote(str(LOGFILE))}"
             prepared = prepare_command_for_run(raw_cmd)
             try:
+                # Note: prepare_command_for_run may have already installed/cloned the package in interactive mode
                 run_with_retry(prepared, max_retries=MAX_RETRIES, timeout=CMD_TIMEOUT)
             except Exception as ie:
                 log(f"[!] Persistent failure installing {pkg}: {ie}. Skipping to next package.")
@@ -503,7 +711,6 @@ def install_packages() -> None:
 
 # ---------------------------------------------------------------------------
 # Tool manager (writer) - improved: shallow clone, retry, supports git/url/gist entries
-#  Includes rollback notifications via termux-notification (if available)
 # ---------------------------------------------------------------------------
 def create_tool_manager() -> None:
     log(f"Writing tool manager to: {TOOL_MANAGER_SCRIPT}")
@@ -521,7 +728,6 @@ BACKUP_DIR="$HOME/tool-backups"
 mkdir -p "$TOOLS_DIR" "$BACKUP_DIR"
 
 notify() {
-  # usage: notify "Title" "Message" id
   title="$1"; message="$2"; id="${3:-9999}"
   if command -v termux-notification >/dev/null 2>&1; then
     termux-notification -t "$title" -c "$message" -i "$id" >/dev/null 2>&1 || true
@@ -629,7 +835,6 @@ process_line() {
   [ -z "$line" ] && return
   [[ "$line" = \#* ]] && return
   local src="$line"
-  # detect prefix
   if [[ "$src" == url+* ]]; then
     local url="${src#url+}"
     local name; name=$(basename "$url")
@@ -640,7 +845,6 @@ process_line() {
     tmp="$dest.tmp"
     if download_url_with_retry "$url" "$tmp"; then
       mkdir -p "$dest"
-      # try to extract common archive types, else just move
       if file "$tmp" | grep -q -E 'gzip|bzip2|Zip archive|tar'; then
         tar -xzf "$tmp" -C "$dest" || (unzip -q "$tmp" -d "$dest" || true)
         rm -f "$tmp"
@@ -653,7 +857,6 @@ process_line() {
       [ -n "$backup_file" ] && rollback_tool "${name%.*}" "$backup_file"
     fi
   else
-    # treat as git URL (allow optional git+ or gist+ prefixes)
     if [[ "$src" == git+* ]]; then
       src="${src#git+}"
     elif [[ "$src" == gist+* ]]; then
@@ -668,10 +871,8 @@ process_line() {
       if git_pull_with_retry "$path"; then
         (cd "$path" && ( [ -f requirements.txt ] && pip install -r requirements.txt || true ) )
         (cd "$path" && ( [ -f install.sh ] && bash install.sh || true ) )
-        # optional health-check scripts
         if [ -f "$path/tooltest.sh" ] || [ -f "$path/test.sh" ]; then
           (cd "$path" && bash -n tooltest.sh >/dev/null 2>&1 || true)
-          # run actual health checks if present
           (cd "$path" && bash tooltest.sh >/dev/null 2>&1) || {
             echo "Health check failed; rolling back $name"
             rollback_tool "$name" "$backup_file"
@@ -710,10 +911,13 @@ main() {
 }
 main
 """
-    with open(TOOL_MANAGER_SCRIPT, "w", encoding="utf-8") as f:
-        f.write(content)
-    run_raw(["bash", "-lc", f"chmod +x {shlex.quote(str(TOOL_MANAGER_SCRIPT))}"])
-    log("Tool manager written and made executable.")
+    try:
+        with open(TOOL_MANAGER_SCRIPT, "w", encoding="utf-8") as f:
+            f.write(content)
+        run_raw(["bash", "-lc", f"chmod +x {shlex.quote(str(TOOL_MANAGER_SCRIPT))}"])
+        log("Tool manager written and made executable.")
+    except Exception as e:
+        log(f"[create_tool_manager] write failed: {e}", to_console=True)
 
 # ---------------------------------------------------------------------------
 # Self-update script (keeps simple and safe)
@@ -728,10 +932,13 @@ echo "[*] termux-self-update: upgrading installed packages..."
 pkg upgrade -y || true
 echo "✔ termux-self-update completed."
 """
-    with open(SELF_UPDATE_SCRIPT, "w", encoding="utf-8") as f:
-        f.write(content)
-    run_raw(["bash", "-lc", f"chmod +x {shlex.quote(str(SELF_UPDATE_SCRIPT))}"])
-    log("Self-update script created.")
+    try:
+        with open(SELF_UPDATE_SCRIPT, "w", encoding="utf-8") as f:
+            f.write(content)
+        run_raw(["bash", "-lc", f"chmod +x {shlex.quote(str(SELF_UPDATE_SCRIPT))}"])
+        log("Self-update script created.")
+    except Exception as e:
+        log(f"[create_self_update] write failed: {e}", to_console=True)
 
 # ---------------------------------------------------------------------------
 # Auto-maintain script
@@ -781,10 +988,13 @@ if command -v termux-notification >/dev/null 2>&1; then
   termux-notification -t "Termux Auto Maintain" -c "Maintenance completed at $(date '+%H:%M')" -i 9999 >/dev/null 2>&1 || true
 fi
 """
-    with open(AUTO_MAINTAIN_SCRIPT, "w", encoding="utf-8") as f:
-        f.write(content)
-    run_raw(["bash", "-lc", f"chmod +x {shlex.quote(str(AUTO_MAINTAIN_SCRIPT))}"])
-    log("Auto-maintain script created.")
+    try:
+        with open(AUTO_MAINTAIN_SCRIPT, "w", encoding="utf-8") as f:
+            f.write(content)
+        run_raw(["bash", "-lc", f"chmod +x {shlex.quote(str(AUTO_MAINTAIN_SCRIPT))}"])
+        log("Auto-maintain script created.")
+    except Exception as e:
+        log(f"[create_auto_maintain] write failed: {e}", to_console=True)
 
 # ---------------------------------------------------------------------------
 # Smart runner addition to .bashrc (auto-start auto-maintain unconditionally)
@@ -803,7 +1013,6 @@ def add_smart_runner() -> None:
     except Exception:
         data = ""
 
-    # Auto-start auto-maintain unconditionally on shell open (user requested)
     smart = r"""
 # ===== Smart Auto Runner (by Termux Power Suite) =====
 run_file() {
@@ -857,25 +1066,26 @@ alias maintain="$HOME/termux-auto-maintain.sh"
 ($HOME/termux-auto-maintain.sh > /dev/null 2>&1 &)
 # ===== End Smart Auto Runner =====
 """
-    with open(BASHRC, "a", encoding="utf-8") as f:
-        f.write("\n" + smart)
-    log("Smart Auto Runner appended to ~/.bashrc (auto-maintain will start on shell open)", to_console=True)
+    try:
+        with open(BASHRC, "a", encoding="utf-8") as f:
+            f.write("\n" + smart)
+        log("Smart Auto Runner appended to ~/.bashrc (auto-maintain will start on shell open)", to_console=True)
+    except Exception as e:
+        log(f"[add_smart_runner] append failed: {e}", to_console=True)
 
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 def main() -> None:
-    log("Termux Power Suite (auto-heavy + retry + pkg-autocorrect + rollback-notify) started")
+    log("Termux Power Suite (auto-heavy + retry + pkg-autocorrect + interactive-ai) started")
     rotate_logs()
     ensure_dirs()
 
-    # Proceed with heavy installs (user previously allowed auto-heavy)
     try:
         install_packages()
     except Exception as e:
         log(f"[!] install_packages encountered an exception: {e}")
 
-    # Create helper scripts and manager
     try:
         create_self_update()
         create_tool_manager()
@@ -894,7 +1104,7 @@ def main() -> None:
     print()
     print("Open a NEW Termux session or run: source ~/.bashrc")
     print("Auto-maintain will start automatically when you open a new shell.")
-    print(f"AUTO_CORRECT_MODE={AUTO_CORRECT_MODE} (set env var to change: silent|ask)")
+    print(f"AUTO_CORRECT_MODE={AUTO_CORRECT_MODE} (set env var to change: silent|ask|ai)")
 
 if __name__ == "__main__":
     try:
