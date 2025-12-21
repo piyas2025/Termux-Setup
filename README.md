@@ -96,6 +96,9 @@ pkg install python -y
 pip install --upgrade pip
 pip install tqdm
 python -m pip install tqdm
+pip install pyfiglet
+python -m pip install pyfiglet
+pip install tqdm pyfiglet colorama requests
 pkg install python
 pkg install python2
 pkg install git
