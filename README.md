@@ -97,6 +97,7 @@ pip install python-whois
 pkg update && pkg upgrade
 pkg install python -y
 pip install --upgrade pip
+pkg update && pkg upgrade -y && pkg install python git -y && pip install --upgrade pip && pip install PyRoxy
 pip install tqdm
 python -m pip install tqdm
 pip install pyfiglet
